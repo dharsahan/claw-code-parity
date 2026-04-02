@@ -13,7 +13,7 @@ use super::{Provider, ProviderFuture};
 use crate::sse::SseParser;
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
-pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+pub const DEFAULT_BASE_URL: &str = "http://localhost:4141";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";

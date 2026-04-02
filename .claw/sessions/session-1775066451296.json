@@ -1,0 +1,1 @@
+{"messages":[{"blocks":[{"text":"What is 2+2?","type":"text"}],"role":"user"},{"blocks":[{"text":"2 + 2 = 4\n\nThis is a basic arithmetic calculation. The sum of 2 and 2 equals 4.","type":"text"}],"role":"assistant","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":10630,"output_tokens":35}}],"version":1}

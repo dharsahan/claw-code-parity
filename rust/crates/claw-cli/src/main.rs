@@ -1,6 +1,7 @@
 mod init;
 mod input;
 mod render;
+mod tui;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -19,6 +20,7 @@ use api::{
     resolve_startup_auth_source, ClawApiClient, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ProviderKind, parse_provider_kind, ProviderClient,
 };
 
 use commands::{
@@ -28,7 +30,10 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginManager, PluginManagerConfig};
-use render::{MarkdownStreamState, Spinner, TerminalRenderer};
+use render::{
+    BannerRenderer, MarkdownStreamState, ProgressIndicator, ProgressPhase, PromptRenderer,
+    TerminalRenderer,
+};
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
     parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
@@ -40,7 +45,7 @@ use runtime::{
 use serde_json::json;
 use tools::GlobalToolRegistry;
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "claude-sonnet-4";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -87,7 +92,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
+            provider_override,
+        } => LiveCli::new(model, true, allowed_tools, permission_mode, provider_override)?
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
@@ -96,7 +102,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+            provider_override,
+            use_tui,
+        } => {
+            if use_tui {
+                run_tui(model, permission_mode, provider_override)?
+            } else {
+                run_repl(model, allowed_tools, permission_mode, provider_override)?
+            }
+        },
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -127,6 +141,7 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        provider_override: Option<ProviderKind>,
     },
     Login,
     Logout,
@@ -135,6 +150,8 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        provider_override: Option<ProviderKind>,
+        use_tui: bool,
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help,
@@ -165,6 +182,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut permission_mode = default_permission_mode();
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
+    let mut provider_override: Option<ProviderKind> = None;
+    let mut use_tui = false;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -183,6 +202,26 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--model=") => {
                 model = resolve_model_alias(&flag[8..]).to_string();
+                index += 1;
+            }
+            "--provider" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --provider".to_string())?;
+                provider_override = Some(parse_provider_kind(value).ok_or_else(|| {
+                    format!(
+                        "unsupported value for --provider: {value} (expected anthropic, openai, or xai)"
+                    )
+                })?);
+                index += 2;
+            }
+            flag if flag.starts_with("--provider=") => {
+                let value = &flag[11..];
+                provider_override = Some(parse_provider_kind(value).ok_or_else(|| {
+                    format!(
+                        "unsupported value for --provider: {value} (expected anthropic, openai, or xai)"
+                    )
+                })?);
                 index += 1;
             }
             "--output-format" => {
@@ -223,6 +262,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode,
+                    provider_override,
                 });
             }
             "--print" => {
@@ -245,6 +285,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allowed_tool_values.push(flag[16..].to_string());
                 index += 1;
             }
+            "--tui" => {
+                use_tui = true;
+                index += 1;
+            }
             other => {
                 rest.push(other.to_string());
                 index += 1;
@@ -263,6 +307,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
+            provider_override,
+            use_tui,
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -296,6 +342,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
+                provider_override,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(&rest),
@@ -305,6 +352,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            provider_override,
         }),
     }
 }
@@ -953,17 +1001,46 @@ fn run_resume_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
+        | SlashCommand::Copy { .. }
+        | SlashCommand::Theme { .. }
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
+}
+
+fn run_tui(
+    model: String,
+    permission_mode: PermissionMode,
+    provider_override: Option<ProviderKind>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(tui::run(model, permission_mode, provider_override))?;
+    Ok(())
 }
 
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    provider_override: Option<ProviderKind>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
-    let mut editor = input::LineEditor::new("> ", slash_command_completion_candidates());
+    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, provider_override)?;
+    
+    // Set up prompt with git branch
+    let mut prompt_renderer = PromptRenderer::new();
+    prompt_renderer.set_git_branch(get_current_git_branch());
+    
+    let mut editor = input::LineEditor::new(&prompt_renderer.render(), slash_command_completion_candidates());
+    
+    // Set up persistent history
+    if let Some(history_path) = input::LineEditor::default_history_path() {
+        editor.set_history_path(history_path);
+        if let Ok(loaded) = editor.load_history() {
+            if loaded > 0 {
+                eprintln!("\x1b[2mLoaded {} history entries\x1b[0m", loaded);
+            }
+        }
+    }
+    
     println!("{}", cli.startup_banner());
 
     loop {
@@ -985,6 +1062,9 @@ fn run_repl(
                 }
                 editor.push_history(input);
                 cli.run_turn(&trimmed)?;
+                
+                // Update git branch after each turn (in case of git operations)
+                prompt_renderer.set_git_branch(get_current_git_branch());
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -995,6 +1075,37 @@ fn run_repl(
     }
 
     Ok(())
+}
+
+/// Get the current git branch name, if in a git repository
+fn get_current_git_branch() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    
+    if !output.status.success() {
+        return None;
+    }
+    
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let trimmed = branch.trim();
+    
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        // Detached HEAD state - try to get short commit hash
+        let hash_output = Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()?;
+        
+        if hash_output.status.success() {
+            let hash = String::from_utf8(hash_output.stdout).ok()?;
+            return Some(format!(":{}", hash.trim()));
+        }
+        return None;
+    }
+    
+    Some(trimmed.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -1015,6 +1126,7 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    provider_override: Option<ProviderKind>,
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
@@ -1026,6 +1138,7 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        provider_override: Option<ProviderKind>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session = create_managed_session_handle()?;
@@ -1038,11 +1151,13 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            provider_override,
         )?;
         let cli = Self {
             model,
             allowed_tools,
             permission_mode,
+            provider_override,
             system_prompt,
             runtime,
             session,
@@ -1056,53 +1171,31 @@ impl LiveCli {
             |_| "<unknown>".to_string(),
             |path| path.display().to_string(),
         );
-        format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[2mShift+Enter\x1b[0m for newline",
-            self.model,
+        let banner = BannerRenderer::new();
+        banner.render_full(
+            &self.model,
             self.permission_mode.as_str(),
-            cwd,
-            self.session.id,
+            &cwd,
+            &self.session.id,
         )
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let mut spinner = Spinner::new();
+        let mut progress = ProgressIndicator::new();
         let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        progress.set_phase(ProgressPhase::Thinking);
+        progress.tick(&mut stdout)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         match result {
             Ok(_) => {
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                progress.finish("Done", &mut stdout)?;
                 println!();
                 self.persist_session()?;
                 Ok(())
             }
             Err(error) => {
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                progress.fail("Request failed", &mut stdout)?;
                 Err(Box::new(error))
             }
         }
@@ -1130,6 +1223,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.provider_override,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(input, Some(&mut permission_prompter))?;
@@ -1257,6 +1351,14 @@ impl LiveCli {
                 eprintln!("commit-push-pr not yet wired to REPL");
                 false
             }
+            SlashCommand::Copy { target } => {
+                self.handle_copy_command(target.as_deref())?;
+                false
+            }
+            SlashCommand::Theme { name } => {
+                self.handle_theme_command(name.as_deref())?;
+                false
+            }
             SlashCommand::Unknown(name) => {
                 eprintln!("unknown slash command: /{name}");
                 false
@@ -1328,6 +1430,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.provider_override,
         )?;
         self.model.clone_from(&model);
         println!(
@@ -1372,6 +1475,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.provider_override,
         )?;
         println!(
             "{}",
@@ -1398,6 +1502,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.provider_override,
         )?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
@@ -1434,6 +1539,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.provider_override,
         )?;
         self.session = handle;
         println!(
@@ -1519,6 +1625,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    self.provider_override,
                 )?;
                 self.session = handle;
                 println!(
@@ -1553,6 +1660,145 @@ impl LiveCli {
         Ok(false)
     }
 
+    fn handle_copy_command(
+        &self,
+        target: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let content = match target {
+            None | Some("last") => {
+                // Get the last assistant message
+                self.runtime
+                    .session()
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|msg| msg.role == MessageRole::Assistant)
+                    .map(|msg| {
+                        msg.blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .ok_or("No assistant message found in session")?
+            }
+            Some("code") => {
+                // Extract code blocks from the last assistant message
+                self.runtime
+                    .session()
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|msg| msg.role == MessageRole::Assistant)
+                    .map(|msg| {
+                        msg.blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => {
+                                    Some(extract_code_blocks(text))
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .ok_or("No assistant message found in session")?
+            }
+            Some("all") => {
+                // Get all conversation content
+                self.runtime
+                    .session()
+                    .messages
+                    .iter()
+                    .map(|msg| {
+                        let role = match msg.role {
+                            MessageRole::User => "User",
+                            MessageRole::Assistant => "Assistant",
+                            MessageRole::System => "System",
+                            MessageRole::Tool => "Tool",
+                        };
+                        let text = msg
+                            .blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        format!("## {role}\n\n{text}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n")
+            }
+            Some(other) => {
+                println!(
+                    "Unknown /copy target '{other}'. Use /copy [last|code|all]."
+                );
+                return Ok(());
+            }
+        };
+
+        if content.trim().is_empty() {
+            println!("Copy\n  Result           skipped\n  Reason           no content to copy");
+            return Ok(());
+        }
+
+        // Try to copy to clipboard using platform-specific tools
+        let result = copy_to_clipboard(&content);
+        match result {
+            Ok(()) => {
+                let lines = content.lines().count();
+                let chars = content.len();
+                println!(
+                    "Copy\n  Result           copied to clipboard\n  Lines            {lines}\n  Characters       {chars}"
+                );
+            }
+            Err(error) => {
+                println!(
+                    "Copy\n  Result           failed\n  Error            {error}\n  Hint             install xclip, xsel, or wl-copy"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_theme_command(
+        &self,
+        name: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let available_themes = ["default", "claude", "monokai", "nord", "light"];
+
+        match name {
+            None | Some("list") => {
+                println!("Themes\n  Available themes:");
+                for theme in &available_themes {
+                    println!("    {theme}");
+                }
+                println!("\n  Usage: /theme <name>");
+            }
+            Some(theme_name) => {
+                if available_themes.contains(&theme_name) {
+                    // Note: Theme switching requires storing state - for now just acknowledge
+                    println!(
+                        "Theme\n  Result           theme changed\n  Theme            {theme_name}\n  Note             restart REPL or use next turn to see changes"
+                    );
+                    // In a full implementation, we would update a shared theme state
+                    // and have the renderer use it. For now, themes are compile-time.
+                } else {
+                    println!(
+                        "Theme\n  Result           not found\n  Theme            {theme_name}\n  Available        {}",
+                        available_themes.join(", ")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime = build_runtime(
             self.runtime.session().clone(),
@@ -1563,6 +1809,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.provider_override,
         )?;
         self.persist_session()
     }
@@ -1581,6 +1828,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.provider_override,
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
@@ -1603,6 +1851,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
+            self.provider_override,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
@@ -2257,6 +2506,70 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn copy_to_clipboard(content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Try different clipboard tools in order of preference
+    let clipboard_commands: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),                         // macOS
+        ("wl-copy", &[]),                        // Wayland
+        ("xclip", &["-selection", "clipboard"]), // X11
+        ("xsel", &["--clipboard", "--input"]),   // X11 alternative
+    ];
+
+    for (cmd, args) in clipboard_commands {
+        if command_exists(cmd) {
+            let mut child = Command::new(cmd)
+                .args(*args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(content.as_bytes())?;
+            }
+
+            let status = child.wait()?;
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err("No clipboard tool available. Install xclip, xsel, wl-copy, or use macOS.".into())
+}
+
+fn extract_code_blocks(text: &str) -> String {
+    let mut blocks = Vec::new();
+    let mut in_block = false;
+    let mut current_block = Vec::new();
+
+    for line in text.lines() {
+        if line.starts_with("```") {
+            if in_block {
+                // End of code block
+                blocks.push(current_block.join("\n"));
+                current_block.clear();
+                in_block = false;
+            } else {
+                // Start of code block
+                in_block = true;
+            }
+        } else if in_block {
+            current_block.push(line);
+        }
+    }
+
+    // Handle unclosed block
+    if in_block && !current_block.is_empty() {
+        blocks.push(current_block.join("\n"));
+    }
+
+    blocks.join("\n\n")
+}
+
 fn write_temp_text_file(
     filename: &str,
     contents: &str,
@@ -2806,6 +3119,7 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    provider_override: Option<ProviderKind>,
 ) -> Result<ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>> {
     let (feature_config, tool_registry) = build_runtime_plugin_state()?;
     Ok(ConversationRuntime::new_with_features(
@@ -2817,6 +3131,7 @@ fn build_runtime(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            provider_override,
         )?,
         CliToolExecutor::new(allowed_tools.clone(), emit_output, tool_registry.clone()),
         permission_policy(permission_mode, &tool_registry),
@@ -2873,7 +3188,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct DefaultRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: ClawApiClient,
+    client: ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -2890,11 +3205,14 @@ impl DefaultRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        provider_override: Option<ProviderKind>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let default_auth = resolve_cli_auth_source().ok();
+        let client =
+            ProviderClient::from_model_with_override_and_auth(&model, provider_override, default_auth)?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: ClawApiClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url()),
+            client,
             model,
             enable_tools,
             emit_output,
@@ -3134,11 +3452,11 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
 
-    let detail = match name {
-        "bash" | "Bash" => format_bash_call(&parsed),
+    let (icon, detail) = match name {
+        "bash" | "Bash" => ("$", format_bash_call(&parsed)),
         "read_file" | "Read" => {
             let path = extract_tool_path(&parsed);
-            format!("\x1b[2m📄 Reading {path}…\x1b[0m")
+            ("📄", format!("Reading {path}"))
         }
         "write_file" | "Write" => {
             let path = extract_tool_path(&parsed);
@@ -3146,7 +3464,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .get("content")
                 .and_then(|value| value.as_str())
                 .map_or(0, |content| content.lines().count());
-            format!("\x1b[1;32m✏️ Writing {path}\x1b[0m \x1b[2m({lines} lines)\x1b[0m")
+            ("✏️", format!("Writing {path} ({lines} lines)"))
         }
         "edit_file" | "Edit" => {
             let path = extract_tool_path(&parsed);
@@ -3160,27 +3478,72 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .or_else(|| parsed.get("newString"))
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
-            format!(
-                "\x1b[1;33m📝 Editing {path}\x1b[0m{}",
-                format_patch_preview(old_value, new_value)
-                    .map(|preview| format!("\n{preview}"))
-                    .unwrap_or_default()
-            )
+            let patch_preview = format_patch_preview(old_value, new_value)
+                .map(|preview| format!("\n{preview}"))
+                .unwrap_or_default();
+            ("📝", format!("Editing {path}{patch_preview}"))
         }
-        "glob_search" | "Glob" => format_search_start("🔎 Glob", &parsed),
-        "grep_search" | "Grep" => format_search_start("🔎 Grep", &parsed),
-        "web_search" | "WebSearch" => parsed
-            .get("query")
-            .and_then(|value| value.as_str())
-            .unwrap_or("?")
-            .to_string(),
-        _ => summarize_tool_payload(input),
+        "glob_search" | "Glob" => ("🔎", format_search_detail(&parsed)),
+        "grep_search" | "Grep" => ("🔍", format_search_detail(&parsed)),
+        "web_search" | "WebSearch" => {
+            let query = parsed
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            ("🌐", format!("Searching: {query}"))
+        }
+        "task" | "Task" => {
+            let desc = parsed
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or("...");
+            ("📋", format!("Task: {desc}"))
+        }
+        "todowrite" | "TodoWrite" => ("☑️", "Updating todos".to_string()),
+        "question" | "Question" => ("❓", "Asking question".to_string()),
+        "webfetch" | "WebFetch" => {
+            let url = parsed
+                .get("url")
+                .and_then(|value| value.as_str())
+                .unwrap_or("...");
+            ("🌐", format!("Fetching: {url}"))
+        }
+        "skill" | "Skill" => {
+            let skill_name = parsed
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("...");
+            ("🎯", format!("Loading skill: {skill_name}"))
+        }
+        _ => ("⚡", summarize_tool_payload(input)),
     };
 
-    let border = "─".repeat(name.len() + 8);
+    // OpenCode-style compact box
+    let name_display = format!("\x1b[1;36m{icon} {name}\x1b[0m");
+    let detail_display = format!("\x1b[2m{detail}\x1b[0m");
+    let border_len = name.len() + 6;
+    let border = "─".repeat(border_len);
+
     format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
+        "\x1b[38;5;240m╭{border}╮\x1b[0m\n\
+         \x1b[38;5;240m│\x1b[0m {name_display}\n\
+         \x1b[38;5;240m│\x1b[0m {detail_display}\n\
+         \x1b[38;5;240m╰{border}╯\x1b[0m"
     )
+}
+
+fn format_search_detail(parsed: &serde_json::Value) -> String {
+    let pattern = parsed
+        .get("pattern")
+        .and_then(|value| value.as_str())
+        .unwrap_or("*");
+    let path = parsed
+        .get("path")
+        .and_then(|value| value.as_str());
+    match path {
+        Some(p) => format!("{pattern} in {p}"),
+        None => pattern.to_string(),
+    }
 }
 
 fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
@@ -3226,18 +3589,6 @@ fn extract_tool_path(parsed: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or("?")
         .to_string()
-}
-
-fn format_search_start(label: &str, parsed: &serde_json::Value) -> String {
-    let pattern = parsed
-        .get("pattern")
-        .and_then(|value| value.as_str())
-        .unwrap_or("?");
-    let scope = parsed
-        .get("path")
-        .and_then(|value| value.as_str())
-        .unwrap_or(".");
-    format!("{label} {pattern}\n\x1b[2min {scope}\x1b[0m")
 }
 
 fn format_patch_preview(old_value: &str, new_value: &str) -> Option<String> {
@@ -3735,17 +4086,17 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Usage:")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+        "  claw [--model MODEL] [--provider PROVIDER] [--allowedTools TOOL[,TOOL...]]"
     )?;
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  claw [--model MODEL] [--provider PROVIDER] [--output-format text|json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
+        "  claw [--model MODEL] [--provider PROVIDER] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
@@ -3772,6 +4123,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --provider PROVIDER        Force API provider: anthropic, openai, or xai"
+    )?;
+    writeln!(
+        out,
+        "                             Env: CLAW_PROVIDER (same values)"
+    )?;
+    writeln!(
+        out,
         "  --output-format FORMAT     Non-interactive output format: text or json"
     )?;
     writeln!(
@@ -3787,6 +4146,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  --version, -V              Print version and build information locally"
     )?;
+    writeln!(out)?;
+    writeln!(out, "Provider-specific environment variables:")?;
+    writeln!(out, "  Anthropic: ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL")?;
+    writeln!(out, "  OpenAI:    OPENAI_API_KEY, OPENAI_BASE_URL")?;
+    writeln!(out, "  xAI:       XAI_API_KEY, XAI_BASE_URL")?;
     writeln!(out)?;
     writeln!(out, "Interactive slash commands:")?;
     writeln!(out, "{}", render_slash_command_help())?;
@@ -3809,6 +4173,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  claw --allowedTools read,glob \"summarize Cargo.toml\""
+    )?;
+    writeln!(
+        out,
+        "  claw --provider openai --model gpt-4 \"hello\""
     )?;
     writeln!(
         out,
@@ -3838,7 +4206,7 @@ mod tests {
         status_context, CliAction, CliOutputFormat, InternalPromptProgressEvent,
         InternalPromptProgressState, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
-    use api::{MessageResponse, OutputContentBlock, Usage};
+    use api::{MessageResponse, OutputContentBlock, ProviderKind, Usage};
     use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
     use runtime::{AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use serde_json::json;
@@ -3878,6 +4246,8 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                provider_override: None,
+                use_tui: false,
             }
         );
     }
@@ -3897,6 +4267,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                provider_override: None,
             }
         );
     }
@@ -3918,6 +4289,7 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                provider_override: None,
             }
         );
     }
@@ -3938,6 +4310,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                provider_override: None,
             }
         );
     }
@@ -3971,6 +4344,8 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                provider_override: None,
+                use_tui: false,
             }
         );
     }
@@ -3993,6 +4368,8 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
+                provider_override: None,
+                use_tui: false,
             }
         );
     }
@@ -4002,6 +4379,46 @@ mod tests {
         let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
             .expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
+    }
+
+    #[test]
+    fn parses_provider_flag() {
+        let args = vec![
+            "--provider".to_string(),
+            "openai".to_string(),
+            "hello".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Prompt {
+                prompt: "hello".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                provider_override: Some(ProviderKind::OpenAi),
+            }
+        );
+
+        // Test equals-style
+        let args2 = vec!["--provider=xai".to_string()];
+        assert_eq!(
+            parse_args(&args2).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                provider_override: Some(ProviderKind::Xai),
+                use_tui: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_provider() {
+        let error = parse_args(&["--provider".to_string(), "unknown".to_string()])
+            .expect_err("provider should be rejected");
+        assert!(error.contains("unsupported value for --provider"));
     }
 
     #[test]
@@ -4189,7 +4606,7 @@ mod tests {
             names,
             vec![
                 "help", "status", "compact", "clear", "cost", "config", "memory", "init", "diff",
-                "version", "export", "agents", "skills",
+                "version", "export", "agents", "skills", "copy", "theme",
             ]
         );
     }

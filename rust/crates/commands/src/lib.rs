@@ -247,6 +247,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: None,
         resume_supported: true,
     },
+    SlashCommandSpec {
+        name: "copy",
+        aliases: &[],
+        summary: "Copy last response or content to clipboard",
+        argument_hint: Some("[last|code|all]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "theme",
+        aliases: &[],
+        summary: "List or switch color themes",
+        argument_hint: Some("[list|<theme-name>]"),
+        resume_supported: true,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +333,12 @@ pub enum SlashCommand {
     },
     Skills {
         args: Option<String>,
+    },
+    Copy {
+        target: Option<String>,
+    },
+    Theme {
+        name: Option<String>,
     },
     Unknown(String),
 }
@@ -405,6 +425,12 @@ impl SlashCommand {
             },
             "skills" => Self::Skills {
                 args: remainder_after_command(trimmed, command),
+            },
+            "copy" => Self::Copy {
+                target: parts.next().map(ToOwned::to_owned),
+            },
+            "theme" => Self::Theme {
+                name: parts.next().map(ToOwned::to_owned),
             },
             other => Self::Unknown(other.to_string()),
         })
@@ -1640,6 +1666,8 @@ pub fn handle_slash_command(
         | SlashCommand::Plugins { .. }
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
+        | SlashCommand::Copy { .. }
+        | SlashCommand::Theme { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }

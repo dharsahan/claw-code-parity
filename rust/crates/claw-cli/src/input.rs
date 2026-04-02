@@ -1,10 +1,14 @@
 use std::borrow::Cow;
-use std::io::{self, IsTerminal, Write};
+use std::fs;
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::path::PathBuf;
 
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::queue;
 use crossterm::terminal::{self, Clear, ClearType};
+
+const MAX_HISTORY_ENTRIES: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
@@ -223,7 +227,7 @@ impl EditSession {
         let cursor_row = cursor_prefix.bytes().filter(|byte| *byte == b'\n').count();
         let cursor_col = match cursor_prefix.rsplit_once('\n') {
             Some((_, suffix)) => suffix.chars().count(),
-            None => prompt.chars().count() + cursor_prefix.chars().count(),
+            None => visible_width(prompt) + cursor_prefix.chars().count(),
         };
         let total_lines = active_text.bytes().filter(|byte| *byte == b'\n').count() + 1;
         (cursor_row, cursor_col, total_lines)
@@ -242,6 +246,7 @@ pub struct LineEditor {
     prompt: String,
     completions: Vec<String>,
     history: Vec<String>,
+    history_path: Option<PathBuf>,
     yank_buffer: YankBuffer,
     vim_enabled: bool,
 }
@@ -253,9 +258,80 @@ impl LineEditor {
             prompt: prompt.into(),
             completions,
             history: Vec::new(),
+            history_path: None,
             yank_buffer: YankBuffer::default(),
             vim_enabled: false,
         }
+    }
+
+    /// Set the path for persistent history file
+    pub fn set_history_path(&mut self, path: PathBuf) {
+        self.history_path = Some(path);
+    }
+
+    /// Load history from the configured history file
+    pub fn load_history(&mut self) -> io::Result<usize> {
+        let Some(path) = &self.history_path else {
+            return Ok(0);
+        };
+        if !path.exists() {
+            return Ok(0);
+        }
+
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let mut loaded = 0;
+
+        for line in reader.lines() {
+            let entry = line?;
+            if !entry.trim().is_empty() {
+                // Unescape newlines for multi-line entries
+                let unescaped = entry.replace("\\n", "\n");
+                self.history.push(unescaped);
+                loaded += 1;
+            }
+        }
+
+        // Trim to max entries, keeping most recent
+        if self.history.len() > MAX_HISTORY_ENTRIES {
+            let excess = self.history.len() - MAX_HISTORY_ENTRIES;
+            self.history.drain(0..excess);
+        }
+
+        Ok(loaded)
+    }
+
+    /// Save history to the configured history file
+    pub fn save_history(&self) -> io::Result<()> {
+        let Some(path) = &self.history_path else {
+            return Ok(());
+        };
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Only save most recent MAX_HISTORY_ENTRIES
+        let start = self.history.len().saturating_sub(MAX_HISTORY_ENTRIES);
+        let entries_to_save = &self.history[start..];
+
+        let mut file = fs::File::create(path)?;
+        for entry in entries_to_save {
+            // Escape newlines for multi-line entries
+            let escaped = entry.replace('\n', "\\n");
+            writeln!(file, "{escaped}")?;
+        }
+
+        Ok(())
+    }
+
+    /// Get the default history file path (~/.claw_history)
+    #[must_use]
+    pub fn default_history_path() -> Option<PathBuf> {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".claw_history"))
     }
 
     pub fn push_history(&mut self, entry: impl Into<String>) {
@@ -264,7 +340,17 @@ impl LineEditor {
             return;
         }
 
+        // Avoid consecutive duplicates
+        if self.history.last().map(String::as_str) == Some(entry.trim()) {
+            return;
+        }
+
         self.history.push(entry);
+
+        // Auto-save on push if path is configured
+        if self.history_path.is_some() {
+            let _ = self.save_history();
+        }
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
@@ -918,6 +1004,31 @@ fn to_u16(value: usize) -> io::Result<u16> {
             "terminal position overflowed u16",
         )
     })
+}
+
+/// Strip ANSI escape codes from a string to get visible character count
+fn visible_width(input: &str) -> usize {
+    let mut width = 0;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip escape sequence
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // Skip until we hit a letter (end of escape sequence)
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+
+    width
 }
 
 #[cfg(test)]

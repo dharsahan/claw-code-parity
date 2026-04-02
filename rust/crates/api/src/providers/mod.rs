@@ -184,6 +184,45 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     None
 }
 
+/// Parse a provider name string into a `ProviderKind`.
+/// Returns `None` if the string is not recognized.
+#[must_use]
+pub fn parse_provider_kind(s: &str) -> Option<ProviderKind> {
+    match s.to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" | "claw" => Some(ProviderKind::ClawApi),
+        "openai" | "openai-compatible" => Some(ProviderKind::OpenAi),
+        "xai" | "grok" => Some(ProviderKind::Xai),
+        _ => None,
+    }
+}
+
+/// Read the `CLAW_PROVIDER` environment variable and parse it into a `ProviderKind`.
+#[must_use]
+pub fn provider_override_from_env() -> Option<ProviderKind> {
+    std::env::var("CLAW_PROVIDER")
+        .ok()
+        .and_then(|s| parse_provider_kind(&s))
+}
+
+/// Detect the provider to use, with optional explicit override.
+/// Priority: explicit override > env var override > model-based detection > credential detection
+#[must_use]
+pub fn detect_provider_kind_with_override(
+    model: &str,
+    explicit_override: Option<ProviderKind>,
+) -> ProviderKind {
+    // 1. Explicit override from CLI flag
+    if let Some(provider) = explicit_override {
+        return provider;
+    }
+    // 2. Environment variable override
+    if let Some(provider) = provider_override_from_env() {
+        return provider;
+    }
+    // 3. Model-based detection
+    detect_provider_kind(model)
+}
+
 #[must_use]
 pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
@@ -235,5 +274,35 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+    }
+
+    #[test]
+    fn parses_provider_kind_strings() {
+        use super::parse_provider_kind;
+        assert_eq!(parse_provider_kind("anthropic"), Some(ProviderKind::ClawApi));
+        assert_eq!(parse_provider_kind("claude"), Some(ProviderKind::ClawApi));
+        assert_eq!(parse_provider_kind("openai"), Some(ProviderKind::OpenAi));
+        assert_eq!(parse_provider_kind("xai"), Some(ProviderKind::Xai));
+        assert_eq!(parse_provider_kind("grok"), Some(ProviderKind::Xai));
+        assert_eq!(parse_provider_kind("unknown"), None);
+    }
+
+    #[test]
+    fn detect_provider_with_override_respects_explicit_override() {
+        use super::detect_provider_kind_with_override;
+        // Explicit override takes precedence over model name
+        assert_eq!(
+            detect_provider_kind_with_override("grok", Some(ProviderKind::OpenAi)),
+            ProviderKind::OpenAi
+        );
+        assert_eq!(
+            detect_provider_kind_with_override("claude-sonnet-4-6", Some(ProviderKind::Xai)),
+            ProviderKind::Xai
+        );
+        // None override falls back to model-based detection
+        assert_eq!(
+            detect_provider_kind_with_override("grok", None),
+            ProviderKind::Xai
+        );
     }
 }

@@ -12,7 +12,8 @@ pub use error::ApiError;
 pub use providers::claw_provider::{AuthSource, ClawApiClient, ClawApiClient as ApiClient};
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
 pub use providers::{
-    detect_provider_kind, max_tokens_for_model, resolve_model_alias, ProviderKind,
+    detect_provider_kind, detect_provider_kind_with_override, max_tokens_for_model,
+    parse_provider_kind, provider_override_from_env, resolve_model_alias, ProviderKind,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

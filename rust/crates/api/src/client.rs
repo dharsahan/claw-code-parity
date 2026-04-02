@@ -49,6 +49,37 @@ impl ProviderClient {
         }
     }
 
+    /// Create a provider client with an explicit provider override.
+    /// Uses `detect_provider_kind_with_override` for selection priority:
+    /// explicit override > CLAW_PROVIDER env var > model-based detection.
+    pub fn from_model_with_override(
+        model: &str,
+        provider_override: Option<ProviderKind>,
+    ) -> Result<Self, ApiError> {
+        Self::from_model_with_override_and_auth(model, provider_override, None)
+    }
+
+    /// Create a provider client with explicit provider override and default auth.
+    pub fn from_model_with_override_and_auth(
+        model: &str,
+        provider_override: Option<ProviderKind>,
+        default_auth: Option<AuthSource>,
+    ) -> Result<Self, ApiError> {
+        let resolved_model = providers::resolve_model_alias(model);
+        match providers::detect_provider_kind_with_override(&resolved_model, provider_override) {
+            ProviderKind::ClawApi => Ok(Self::ClawApi(match default_auth {
+                Some(auth) => ClawApiClient::from_auth(auth),
+                None => ClawApiClient::from_env()?,
+            })),
+            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::xai(),
+            )?)),
+            ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::openai(),
+            )?)),
+        }
+    }
+
     #[must_use]
     pub const fn provider_kind(&self) -> ProviderKind {
         match self {
